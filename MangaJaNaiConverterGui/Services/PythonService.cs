@@ -118,15 +118,44 @@ namespace MangaJaNaiConverterGui.Services
 
         public async Task<bool> IsBackendUpdated()
         {
+            // installs from before flavors existed are the prebuilt CUDA backend
+            var installedFlavor = File.Exists(PythonBackendFlavorPath) ? (await File.ReadAllTextAsync(PythonBackendFlavorPath)).Trim() : "cuda";
+
+            if (Flavor.Kind != BackendKind.Cuda)
+            {
+                // pip-installed flavors are versioned by the torch pins, not by the prebuilt CUDA archive version,
+                // so bumping BackendVersion doesn't force a multi-GB reinstall
+                return IsPythonInstalled() && installedFlavor == FlavorStamp;
+            }
+
             if (File.Exists(PythonBackendVersionPath))
             {
                 var currentVersion = new Version(await File.ReadAllTextAsync(PythonBackendVersionPath));
 
-                return currentVersion.CompareTo(BackendVersion) >= 0;
+                return currentVersion.CompareTo(BackendVersion) >= 0 && installedFlavor == Flavor.Id;
             }
 
             return false;
         }
+
+        private BackendFlavor? _flavor;
+
+        public BackendFlavor Flavor => _flavor ??= GpuDetector.DetectFlavor();
+
+        public string PythonBackendFlavorPath => Path.Combine(PythonDirectory, "Flavor.txt");
+
+        /// <summary>
+        /// Content of Flavor.txt identifying the installed backend. For pip-installed (non-CUDA) flavors this
+        /// includes the torch version, e.g. "rocm-gfx120X-all|torch=2.9.1"; for CUDA it is just "cuda".
+        /// </summary>
+        public string FlavorStamp => Flavor.Kind == BackendKind.Cuda ? Flavor.Id : $"{Flavor.Id}|torch={TorchVersion}";
+
+        // ROCm wheels are published per GPU family by AMD (TheRock). torch 2.9.1 / torchvision 0.24.0 are
+        // available for every family that currently has Windows wheels (gfx110X-all, gfx1151, gfx120X-all),
+        // and on the PyTorch CPU index for cp313 win_amd64.
+        public const string TorchVersion = "2.9.1";
+        public const string TorchvisionVersion = "0.24.0";
+        public const string RocmIndexUrl = "https://rocm.nightlies.amd.com/v2";
 
         public bool AreModelsInstalled() => Directory.Exists(ModelsDirectory) && Directory.GetFiles(ModelsDirectory).Length > 0 && Directory.GetFiles(ModelsDirectory).Any(x => x.Contains("2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16"));
 
@@ -223,7 +252,18 @@ namespace MangaJaNaiConverterGui.Services
             {
                 var relPythonPath = @".\python\python\python.exe";
 
-                return $@"{relPythonPath} -m pip install -U pip wheel --no-warn-script-location && {relPythonPath} -m pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu128 --no-warn-script-location && {relPythonPath} -m pip install ""{Path.GetFullPath(@".\backend\src")}"" --no-warn-script-location";
+                var torchInstall = Flavor.Kind switch
+                {
+                    BackendKind.Rocm => $@"--pre torch=={TorchVersion} torchvision=={TorchvisionVersion} --index-url {RocmIndexUrl}/{Flavor.RocmFamily}/",
+                    BackendKind.Cuda => $@"torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu128",
+                    _ => $@"torch=={TorchVersion} torchvision=={TorchvisionVersion} --index-url https://download.pytorch.org/whl/cpu",
+                };
+
+                // onnxruntime-directml is the inference path for GPUs without ROCm/CUDA builds,
+                // and is also offered as a secondary device on ROCm systems.
+                var extras = Flavor.Kind == BackendKind.Cuda ? "" : " onnxruntime-directml onnx";
+
+                return $@"{relPythonPath} -m pip install -U pip wheel --no-warn-script-location && {relPythonPath} -m pip install {torchInstall} --no-warn-script-location && {relPythonPath} -m pip install ""{Path.GetFullPath(@".\backend\src")}""{extras} --no-warn-script-location";
             }
         }
 

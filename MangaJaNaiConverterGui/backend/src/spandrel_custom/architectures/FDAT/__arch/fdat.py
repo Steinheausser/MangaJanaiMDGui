@@ -16,6 +16,44 @@ from spandrel.__helpers.model_descriptor import StateDict
 from spandrel.util import store_hyperparameters
 from spandrel.util.timm import DropPath
 
+try:
+    # custom channels-last depthwise conv for ROCm (MangaJaNai backend)
+    from rocm_kernels import (
+        dwconv3x3_nhwc,
+        dwconv3x3_nhwc_supported,
+        kernels_enabled,
+        layernorm_lastdim,
+        layernorm_supported,
+        window_attention_supported,
+        window_attention_tokens,
+    )
+except ImportError:  # used outside the backend
+    dwconv3x3_nhwc = dwconv3x3_nhwc_supported = kernels_enabled = None
+    layernorm_lastdim = layernorm_supported = None
+    window_attention_supported = window_attention_tokens = None
+
+
+def _token_fast_path(x: Tensor) -> bool:
+    """ROCm only: compute token-layout (B, L, C) ops without converting to NCHW and back."""
+    return kernels_enabled is not None and x.is_cuda and kernels_enabled(x.device)
+
+
+def _layernorm_tokens(x: Tensor, norm: nn.LayerNorm) -> Tensor:
+    if _token_fast_path(x) and layernorm_supported(x, norm.weight):
+        return layernorm_lastdim(x, norm.weight, norm.bias, norm.eps)
+    return norm(x)
+
+
+def _dwconv_tokens(x: Tensor, conv: nn.Conv2d, H: int, W: int, gelu: bool) -> Tensor | None:
+    """Depthwise 3x3 conv on (B, L, C) tokens via the custom kernel, or None if unsupported."""
+    B, L, C = x.shape
+    if L != H * W:
+        return None
+    x4 = x.reshape(B, H, W, C)
+    if not dwconv3x3_nhwc_supported(x4, conv.weight):
+        return None
+    return dwconv3x3_nhwc(x4, conv.weight, conv.bias, gelu=gelu).view(B, L, C)
+
 SampleMods = Literal[
     "conv",
     "pixelshuffledirect",
@@ -461,21 +499,38 @@ class FastSpatialWindowAttention(nn.Module):
             (self.ws - W % self.ws) % self.ws,
             (self.ws - H % self.ws) % self.ws,
         )
+        qkv_tokens = None
+        if pad_r == 0 and pad_b == 0 and _token_fast_path(x):
+            # qkv and proj are per-token, so they commute with the window partition: run attention
+            # directly on token layout with a fused kernel instead of partitioning and reversing
+            qkv_tokens = self.qkv(x)
+            if window_attention_supported(qkv_tokens, self.bias, H, W, self.ws, self.nh):
+                out = window_attention_tokens(qkv_tokens, self.bias, H, W, self.ws, self.nh, self.scale)
+                return self.proj(out)
         if pad_r > 0 or pad_b > 0:
             x = F.pad(x.view(B, H, W, C), (0, 0, 0, pad_r, 0, pad_b)).view(B, -1, C)
 
         H_pad, W_pad = H + pad_b, W + pad_r
-        x = (
-            x.view(B, H_pad // self.ws, self.ws, W_pad // self.ws, self.ws, C)
-            .permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(-1, self.ws * self.ws, C)
-        )
-        qkv = (
-            self.qkv(x)
-            .view(-1, self.ws * self.ws, 3, self.nh, C // self.nh)
-            .permute(2, 0, 3, 1, 4)
-        )
+        if qkv_tokens is not None:
+            # already projected (kernel unsupported for this input): partition the projection instead
+            qkv = (
+                qkv_tokens.view(B, H_pad // self.ws, self.ws, W_pad // self.ws, self.ws, 3 * C)
+                .permute(0, 1, 3, 2, 4, 5)
+                .reshape(-1, self.ws * self.ws, 3, self.nh, C // self.nh)
+                .permute(2, 0, 3, 1, 4)
+            )
+        else:
+            x = (
+                x.view(B, H_pad // self.ws, self.ws, W_pad // self.ws, self.ws, C)
+                .permute(0, 1, 3, 2, 4, 5)
+                .contiguous()
+                .view(-1, self.ws * self.ws, C)
+            )
+            qkv = (
+                self.qkv(x)
+                .view(-1, self.ws * self.ws, 3, self.nh, C // self.nh)
+                .permute(2, 0, 3, 1, 4)
+            )
         q, k, v = qkv.unbind(0)
         attn = (q * self.scale @ k.transpose(-2, -1)) + self.bias
         x = (
@@ -533,6 +588,15 @@ class SimplifiedAIM(nn.Module):
 
     def forward(self, attn_feat, conv_feat, interaction_type, H, W):
         B, L, C = attn_feat.shape
+        if _token_fast_path(attn_feat):
+            # same math on tokens: the 1x1 convs are linears, the global pool is a mean over L
+            if interaction_type == "spatial_modulates_channel":
+                sm = torch.sigmoid(F.linear(attn_feat, self.sg[0].weight.view(1, C)))
+                return attn_feat + (conv_feat * sm)
+            pooled = conv_feat.mean(dim=1)
+            hidden = self.cg[2](F.linear(pooled, self.cg[1].weight.flatten(1)))
+            cm = torch.sigmoid(F.linear(hidden, self.cg[3].weight.flatten(1))).view(B, 1, C)
+            return (attn_feat * cm) + conv_feat
         if interaction_type == "spatial_modulates_channel":
             sm = (
                 self.sg(attn_feat.transpose(1, 2).view(B, C, H, W))
@@ -564,6 +628,10 @@ class SimplifiedFFN(nn.Module):
     def forward(self, x, H, W):
         B, L, _C = x.shape
         x = self.drop(self.act(self.fc1(x)))
+        if _token_fast_path(x):
+            x_s = _dwconv_tokens(x, self.smix, H, W, gelu=False)
+            if x_s is not None:
+                return self.drop(self.fc2(x_s))
         x_s = (
             self.smix(x.transpose(1, 2).view(B, x.shape[-1], H, W))
             .view(B, x.shape[-1], L)
@@ -591,12 +659,16 @@ class SimplifiedDATBlock(nn.Module):
 
     def _conv_fwd(self, x, H, W):
         B, L, C = x.shape
+        if _token_fast_path(x):
+            out = _dwconv_tokens(x, self.conv[0], H, W, gelu=True)
+            if out is not None:
+                return out
         return (
             self.conv(x.transpose(1, 2).view(B, C, H, W)).view(B, C, L).transpose(1, 2)
         )
 
     def forward(self, x, H, W):
-        n1 = self.n1(x)
+        n1 = _layernorm_tokens(x, self.n1)
         itype = (
             "channel_modulates_spatial"
             if self.btype == "spatial"
@@ -604,7 +676,7 @@ class SimplifiedDATBlock(nn.Module):
         )
         fused = self.inter(self.attn(n1, H, W), self._conv_fwd(n1, H, W), itype, H, W)
         x = x + self.dp(fused)
-        x = x + self.dp(self.ffn(self.n2(x), H, W))
+        x = x + self.dp(self.ffn(_layernorm_tokens(x, self.n2), H, W))
         return x
 
 

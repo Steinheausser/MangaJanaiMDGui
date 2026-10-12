@@ -7,7 +7,11 @@ import psutil
 import torch
 from accelerator_detection import AcceleratorType
 from nodes.groups import Condition, if_enum_group, if_group
-from nodes.impl.pytorch.auto_split import pytorch_auto_split
+from nodes.impl.pytorch.auto_split import (
+    is_rocm_device,
+    pytorch_auto_split,
+    rocm_max_tile_size,
+)
 from nodes.impl.pytorch.utils import safe_accelerator_cache_empty
 from nodes.impl.upscale.auto_split_tiles import (
     CUSTOM,
@@ -67,6 +71,12 @@ def upscale(
             accelerator_device = options.accelerator_device
 
             # Memory estimation for different accelerator types
+            if is_rocm_device(device):
+                # measured instead of guessed from the parameter count, which is far off for
+                # attention models; overestimating on Windows means silent, very slow paging
+                return MaxTileSize(
+                    rocm_max_tile_size(model, device, use_fp16, options.budget_limit)
+                )
             if device_type in ["cuda", "rocm"]:  # CUDA/ROCm
                 if options.use_fp16:
                     model_bytes = model_bytes // 2

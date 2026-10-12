@@ -1,6 +1,13 @@
 # <img src="logo.png" width="24"></img> MangaJaNaiConverterGui
 [![Discord](https://img.shields.io/discord/1121653618173546546?label=Discord&logo=Discord&logoColor=white)](https://discord.gg/EeFfZUBvxj)
 
+> [!IMPORTANT]
+> **AMD (ROCm) fork.** This fork adds AMD GPU support via ROCm, with DirectML as a fallback for GPUs without ROCm wheels.
+> It was developed and tuned on an **AMD Radeon RX 9070 XT** (RDNA4, gfx1201) on Windows 11, and its performance work
+> (MIOpen settings, custom HIP kernels for FDAT models, tile sizing) targets that card. It **may not work, or may perform
+> worse, on other AMD GPUs**. ROCm is only used for RDNA3 (RX 7000, 780M/760M/740M), Strix Halo and RDNA4 (RX 9000);
+> other GPUs fall back to DirectML. See [docs/AMD_ROCM.md](docs/AMD_ROCM.md) for details and benchmarks.
+
 ## Overview
 This project provides a Windows GUI for upscaling manga images and archives with PyTorch models. It includes a set of models optimized for upscaling manga with Japanese and English text, but many other models are also supported. It also utilizes linear light downscaling to minimize halftone artifacts when downscaling. 
 

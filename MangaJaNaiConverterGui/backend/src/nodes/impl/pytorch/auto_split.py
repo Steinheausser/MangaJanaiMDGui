@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import gc
+import weakref
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from accelerator_detection import get_autocast_device_type, is_device_type_supported_for_autocast
 from nodes.utils.utils import get_h_w_c
 from spandrel import ImageModelDescriptor
 
 from api import Progress
+from sanic.log import logger
 
 from ..upscale.auto_split import Split, Tiler, auto_split
 from .utils import safe_accelerator_cache_empty
@@ -50,6 +53,153 @@ def _rgb_to_bgr(t: torch.Tensor) -> torch.Tensor:
         return t
 
 
+# On ROCm, MIOpen benchmarks convolution kernels for every new input shape (a few seconds per shape,
+# cached on disk afterwards). For architectures that already pad their input internally, padding up to
+# a multiple of this size lets pages/tiles of slightly different sizes share one shape with negligible
+# effect on the output. Plain conv nets (ESRGAN etc.) are not padded: their border pixels would change.
+ROCM_SHAPE_BUCKET = 128
+ROCM_BUCKETED_ARCHITECTURES = {"FDAT"}
+# auto tile size cap, in output pixels per tile (see rocm_max_tile_size)
+ROCM_MAX_TILE_OUTPUT_PIXELS = 20_000_000
+
+# models that hit a convolution MIOpen has no enabled solver for; they run with native convolutions
+_NATIVE_CONV_MODELS: weakref.WeakSet[ImageModelDescriptor] = weakref.WeakSet()
+
+
+def is_rocm_device(device: torch.device) -> bool:
+    return device.type == "cuda" and getattr(torch.version, "hip", None) is not None
+
+
+ROCM_PAD_MODE = "reflect"
+
+
+def _pad_to_bucket(t: torch.Tensor, bucket: int) -> torch.Tensor:
+    h, w = t.shape[-2:]
+    pad_h = -h % bucket
+    pad_w = -w % bucket
+    if pad_h == 0 and pad_w == 0:
+        return t
+    if ROCM_PAD_MODE == "reflect" and (pad_h >= h or pad_w >= w):
+        return F.pad(t, (0, pad_w, 0, pad_h), mode="replicate")
+    if ROCM_PAD_MODE == "zeros":
+        return F.pad(t, (0, pad_w, 0, pad_h))
+    return F.pad(t, (0, pad_w, 0, pad_h), mode=ROCM_PAD_MODE)
+
+
+def _run_model(model: ImageModelDescriptor, t: torch.Tensor) -> torch.Tensor:
+    if model in _NATIVE_CONV_MODELS:
+        with torch.backends.cudnn.flags(enabled=False):
+            return model(t)
+    try:
+        return model(t)
+    except RuntimeError as e:
+        message = str(e).lower()
+        if "miopen" not in message or "alloc" in message or "out of memory" in message:
+            raise
+        logger.warning(f"MIOpen could not run this model ({e}); falling back to native convolutions.")
+        _NATIVE_CONV_MODELS.add(model)
+        with torch.backends.cudnn.flags(enabled=False):
+            return model(t)
+
+
+def prepare_model(model: ImageModelDescriptor, device: torch.device, use_fp16: bool) -> torch.dtype:
+    """Moves the model to the device in its inference dtype (channels-last) and returns that dtype."""
+    dtype = torch.float32
+    if use_fp16:
+        if model.supports_half:
+            dtype = torch.float16
+        elif torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+    if model.dtype != dtype or model.device != device:
+        # (spandrel's descriptor .to() takes no memory_format; apply it to the module itself)
+        model.to(device, dtype)
+        model.model.to(memory_format=torch.channels_last)
+    if is_rocm_device(device):
+        _cap_allocator(device)
+    return dtype
+
+
+# device index -> allocator cap in bytes
+_CAPPED_DEVICES: dict[int, int] = {}
+
+
+def _cap_allocator(device: torch.device) -> None:
+    """
+    Windows pages GPU memory out to system RAM instead of failing when VRAM is oversubscribed, which
+    makes inference many times slower without any error. Capping PyTorch's allocator at the VRAM that
+    is free when upscaling starts makes it release cached blocks, and raise an out-of-memory error
+    (handled by splitting into smaller tiles) rather than grow past physical memory.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index in _CAPPED_DEVICES:
+        return
+    try:
+        free, total = torch.cuda.mem_get_info(device)
+        usable = free + torch.cuda.memory_reserved(device) - 512 * 1024**2
+        fraction = max(0.1, min(0.95, usable / total))
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        _CAPPED_DEVICES[index] = int(fraction * total)
+        logger.debug(f"Capped PyTorch GPU memory at {fraction * total / 1024**3:.2f} GiB")
+    except Exception as e:
+        _CAPPED_DEVICES[index] = 0
+        logger.warning(f"Could not cap GPU memory: {e}")
+
+
+_BYTES_PER_PIXEL: weakref.WeakKeyDictionary[ImageModelDescriptor, dict[torch.dtype, float]] = weakref.WeakKeyDictionary()
+
+
+@torch.inference_mode()
+def measure_bytes_per_pixel(model: ImageModelDescriptor, device: torch.device, dtype: torch.dtype) -> float:
+    """Peak GPU memory per input pixel of one forward pass, measured once per model on a probe tile."""
+    per_dtype = _BYTES_PER_PIXEL.setdefault(model, {})
+    if dtype in per_dtype:
+        return per_dtype[dtype]
+
+    probe = 256
+    x = torch.rand(1, model.input_channels, probe, probe, device=device, dtype=dtype)
+    x = x.to(memory_format=torch.channels_last)
+    torch.cuda.synchronize(device)
+    base = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    # same autocast setup as pytorch_auto_split, so the measurement matches real runs
+    with torch.autocast(
+        device_type=get_autocast_device_type(device),
+        dtype=dtype,
+        enabled=is_device_type_supported_for_autocast(device) and dtype != torch.float32,
+    ):
+        _run_model(model, x)
+    torch.cuda.synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device) - base
+    per_dtype[dtype] = max(peak, 1) / (probe * probe)
+    logger.debug(f"Measured {per_dtype[dtype] / 1024:.1f} KiB of GPU memory per input pixel")
+    return per_dtype[dtype]
+
+
+def rocm_max_tile_size(model: ImageModelDescriptor, device: torch.device, use_fp16: bool, budget_limit_gib: int) -> int:
+    """Largest square tile (a multiple of ROCM_SHAPE_BUCKET) whose forward pass fits in free VRAM."""
+    dtype = prepare_model(model, device, use_fp16)
+    bytes_per_pixel = measure_bytes_per_pixel(model, device, dtype)
+    free, _total = torch.cuda.mem_get_info(device)
+    # memory cached by our allocator is reusable too, up to the allocator cap
+    usable = free + torch.cuda.memory_reserved(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    cap = _CAPPED_DEVICES.get(index, 0)
+    if cap > 0:
+        usable = min(usable, cap)
+    available = max(usable - torch.cuda.memory_allocated(device), 0)
+    budget = available * 0.7
+    if budget_limit_gib > 0:
+        budget = min(budget, budget_limit_gib * 1024**3)
+    # tiles get overlap and bucket padding added on top of this size
+    side = int((budget / bytes_per_pixel) ** 0.5) - ROCM_SHAPE_BUCKET
+    # Tiles whose output exceeds ~20 MP (e.g. above 1024px at 4x) run slower per pixel on RDNA
+    # even when they fit in memory: their full-resolution activations are several GB each.
+    side = min(side, int(ROCM_MAX_TILE_OUTPUT_PIXELS**0.5 / max(model.scale, 1)))
+    side = side // ROCM_SHAPE_BUCKET * ROCM_SHAPE_BUCKET
+    logger.debug(f"ROCm tile size estimate: {side}px ({available / 1024**3:.2f} GiB available)")
+    return max(side, ROCM_SHAPE_BUCKET)
+
+
 def _into_tensor(
     img: np.ndarray, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -87,23 +237,14 @@ def pytorch_auto_split(
     tiler: Tiler,
     progress: Progress,
 ) -> np.ndarray:
-    dtype = torch.float32
-    if use_fp16:
-        if model.supports_half:
-            dtype = torch.float16
-        elif torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-    # print("dtype", dtype, use_fp16, flush=True)
-    if model.dtype != dtype or model.device != device:
-        # print("move model", flush=True)
-        model = model.to(device, dtype, memory_format=torch.channels_last)
+    dtype = prepare_model(model, device, use_fp16)
 
     def upscale(img: np.ndarray, _: object):
         progress.check_aborted()
         if progress.paused:
             # clear resources before pausing
             gc.collect()
-            safe_cuda_cache_empty()
+            safe_accelerator_cache_empty(device)
             progress.suspend()
 
         input_tensor = None
@@ -122,8 +263,14 @@ def pytorch_auto_split(
             autocast_device_type = get_autocast_device_type(device)
             autocast_enabled = is_device_type_supported_for_autocast(device) and use_fp16
             
+            in_h, in_w = input_tensor.shape[-2:]
+            if is_rocm_device(device) and model.architecture.id in ROCM_BUCKETED_ARCHITECTURES:
+                input_tensor = _pad_to_bucket(input_tensor, ROCM_SHAPE_BUCKET)
+
             with torch.autocast(device_type=autocast_device_type, dtype=dtype, enabled=autocast_enabled):
-                output_tensor = model(input_tensor)
+                output_tensor = _run_model(model, input_tensor)
+
+            output_tensor = output_tensor[..., : in_h * model.scale, : in_w * model.scale]
 
             # convert back to numpy
             output_tensor = _into_standard_image_form(output_tensor)
@@ -139,7 +286,15 @@ def pytorch_auto_split(
             return result
         except RuntimeError as e:
             # Check to see if its actually an out of memory error
-            if "allocate" in str(e) or "CUDA" in str(e) or "out of memory" in str(e).lower():
+            message = str(e)
+            lowered = message.lower()
+            if (
+                "allocate" in message
+                or "CUDA" in message
+                or "out of memory" in lowered
+                or "outofmemory" in lowered  # hipErrorOutOfMemory
+                or "allocfailed" in lowered  # miopenStatusAllocFailed
+            ):
                 # Collect garbage (clear memory)
                 if input_tensor is not None:
                     try:

@@ -398,3 +398,7 @@ FodyWeavers.xsd
 *.sln.iml
 
 MangaJaNaiConverterGui/chaiNNer/python/
+
+# pip build artifacts from installing the backend package
+MangaJaNaiConverterGui/backend/src/build/
+MangaJaNaiConverterGui/backend/src/*.egg-info/

@@ -5,8 +5,11 @@ import json
 import os
 import platform
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from queue import Queue
@@ -14,6 +17,15 @@ from multiprocessing import Queue as MPQueue, Process
 from threading import Thread
 from typing import Any, Literal
 from zipfile import ZipFile, ZIP_DEFLATED
+
+_PROCESS_START = time.perf_counter()
+
+sys.path.append(os.path.normpath(os.path.dirname(os.path.abspath(__file__))))
+
+# must run before torch is imported
+from rocm_env import configure_rocm_env
+
+configure_rocm_env()
 
 import cv2
 import numpy as np
@@ -99,6 +111,21 @@ class _ExecutorNodeContext(NodeContext):
             raise ValueError(f"Unknown cleanup type: {after}")
 
 
+TIMING = os.environ.get("MANGAJANAI_TIMING") == "1"
+
+
+def print_line(text: str) -> None:
+    """Writes one whole line in a single write, so lines from different threads never interleave."""
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def log_timing(stage: str, start: float) -> None:
+    """With MANGAJANAI_TIMING=1, prints how long a pipeline stage took (for benchmarking)."""
+    if TIMING:
+        print(f"TIMING {stage} {time.perf_counter() - start:.3f}s", flush=True)
+
+
 def get_tile_size(tile_size_str: str) -> TileSize:
     if tile_size_str == "Auto (Estimate)":
         return ESTIMATE
@@ -145,7 +172,8 @@ def dotgain20_resize(image: np.ndarray, new_size: tuple[int, int]) -> np.ndarray
 
     pil_image = Image.fromarray(image, mode="L")
     pil_image = pil_image.filter(ImageFilter.GaussianBlur(radius=blur_size))
-    pil_image = ImageCms.applyTransform(pil_image, dotgain20togamma1transform, False)
+    to_gamma1, to_dotgain20 = _dotgain_transforms()
+    pil_image = ImageCms.applyTransform(pil_image, to_gamma1, False)
 
     new_image = np.array(pil_image)
     new_image = new_image.astype(np.float32) / 255.0
@@ -153,7 +181,7 @@ def dotgain20_resize(image: np.ndarray, new_size: tuple[int, int]) -> np.ndarray
     new_image = (new_image * 255).round().astype(np.uint8)
 
     pil_image = Image.fromarray(new_image[:, :, 0], mode="L")
-    pil_image = ImageCms.applyTransform(pil_image, gamma1todotgain20transform, False)
+    pil_image = ImageCms.applyTransform(pil_image, to_dotgain20, False)
     return np.array(pil_image)
 
 
@@ -240,7 +268,10 @@ def _read_image(img_stream: bytes, filename: str) -> np.ndarray:
 
 
 def _read_image_from_path(path: str) -> np.ndarray:
-    return pyvips.Image.new_from_file(path, access="sequential", fail=True).icc_transform("srgb").numpy()
+    start = time.perf_counter()
+    image = pyvips.Image.new_from_file(path, access="sequential", fail=True).icc_transform("srgb").numpy()
+    log_timing("read", start)
+    return image
 
 
 def _read_vips(img_stream: bytes) -> np.ndarray:
@@ -314,7 +345,9 @@ def get_chain_for_image(
 
     assert target_scale is not None
 
+    start = time.perf_counter()
     is_grayscale = cv_image_is_grayscale(image, grayscale_detection_threshold)
+    log_timing("grayscale_detect", start)
 
     for chain in chains:
         if should_chain_activate_for_image(
@@ -365,16 +398,35 @@ def ai_upscale_image(
     image: np.ndarray, model_tile_size: TileSize, model: ImageModelDescriptor | None
 ) -> np.ndarray:
     if model is not None:
-        result = upscale_image_node(
-            context,
-            image,
-            model,
-            False,
-            0,
-            model_tile_size,
-            256,
-            False,
-        )
+        from accelerator_detection import AcceleratorType
+        from packages.chaiNNer_pytorch.settings import get_settings
+
+        exec_options = get_settings(context)
+        accelerator_device = exec_options.accelerator_device
+        if accelerator_device.type == AcceleratorType.DIRECTML:
+            # GPUs without a PyTorch backend: run the model through ONNX Runtime DirectML
+            from dml_upscale import dml_upscale_image
+
+            result = dml_upscale_image(
+                image,
+                model,
+                accelerator_device.index,
+                exec_options.use_fp16,
+                model_tile_size,
+                Path(models_directory).parent / "onnx_cache",
+                context,
+            )
+        else:
+            result = upscale_image_node(
+                context,
+                image,
+                model,
+                False,
+                0,
+                model_tile_size,
+                256,
+                False,
+            )
 
         _, _, c = get_h_w_c(image)
 
@@ -386,9 +438,15 @@ def ai_upscale_image(
     return image
 
 
-def postprocess_image(image: np.ndarray) -> np.ndarray:
-    # print(f"postprocess_image")
-    return to_uint8(image, normalized=True)
+def to_uint8_fast(image: np.ndarray) -> np.ndarray:
+    """Same result as to_uint8(image, normalized=True) for float images, using OpenCV."""
+    if image.dtype == np.uint8:
+        return image
+    if image.dtype != np.float32:
+        image = image.astype(np.float32)
+    image = np.clip(image, 0, 1, out=image if image.flags.writeable else None)
+    result = cv2.convertScaleAbs(image, alpha=255.0)
+    return result
 
 
 def final_target_resize(
@@ -436,10 +494,8 @@ def final_target_resize(
     return image
 
 
-def save_image_zip(
+def encode_image(
     image: np.ndarray,
-    file_name: str,
-    output_zip: ZipFile,
     image_format: str,
     lossy_compression_quality: int,
     use_lossless_compression: bool,
@@ -449,10 +505,9 @@ def save_image_zip(
     target_width: int,
     target_height: int,
     is_grayscale: bool,
-) -> None:
-    print(f"save image to zip: {file_name}", flush=True)
-
-    image = to_uint8(image, normalized=True)
+) -> bytes:
+    """Final resize and encode for an image inside an archive (thread-safe: libvips releases the GIL)."""
+    image = to_uint8_fast(image)
 
     image = final_target_resize(
         image,
@@ -468,13 +523,7 @@ def save_image_zip(
     args = {"Q": int(lossy_compression_quality)}
     if image_format in {"webp"}:
         args["lossless"] = use_lossless_compression
-    buf_img = pyvips.Image.new_from_array(image).write_to_buffer(f".{image_format}", **args)
-    output_buffer = io.BytesIO(buf_img)  # type: ignore
-
-    upscaled_image_data = output_buffer.getvalue()
-
-    # Add the resized image to the output zip
-    output_zip.writestr(file_name, upscaled_image_data)
+    return pyvips.Image.new_from_array(image).write_to_buffer(f".{image_format}", **args)
 
 
 def save_image(
@@ -490,9 +539,10 @@ def save_image(
     target_height: int,
     is_grayscale: bool,
 ) -> None:
-    print(f"save image: {output_file_path}", flush=True)
+    print_line(f"save image: {output_file_path}")
 
-    image = to_uint8(image, normalized=True)
+    start = time.perf_counter()
+    image = to_uint8_fast(image)
 
     image = final_target_resize(
         image,
@@ -504,10 +554,14 @@ def save_image(
         is_grayscale,
     )
 
+    log_timing("postprocess_resize", start)
+
+    start = time.perf_counter()
     args = {"Q": int(lossy_compression_quality)}
     if image_format in {"webp"}:
         args["lossless"] = use_lossless_compression
     pyvips.Image.new_from_array(image).write_to_file(output_file_path, **args)
+    log_timing("encode_write", start)
 
 
 def preprocess_worker_archive(
@@ -830,7 +884,9 @@ def preprocess_worker_folder(
                             model = loaded_models[model_abs_path]
 
                         elif os.path.exists(model_abs_path):
+                            start = time.perf_counter()
                             model, _, _ = load_model_node(context, Path(model_abs_path))
+                            log_timing("model_load", start)
                             loaded_models[model_abs_path] = model
                         tile_size_str = chain["ModelTileSize"]
                     else:
@@ -1017,7 +1073,9 @@ def upscale_worker(upscale_queue: Queue, postprocess_queue: Queue) -> None:
             break
 
         if is_image:
+            start = time.perf_counter()
             image = ai_upscale_image(image, model_tile_size, model)
+            log_timing("upscale", start)
 
             # convert back to grayscale
             if is_grayscale:
@@ -1028,6 +1086,60 @@ def upscale_worker(upscale_queue: Queue, postprocess_queue: Queue) -> None:
         )
     postprocess_queue.put(POSTPROCESS_SENTINEL)
     # print("upscale_worker exiting")
+
+
+# WebP/AVIF encoding of upscaled pages is single-threaded in libvips and, at 4x, takes several times
+# longer than the GPU upscale. Encode several pages at once; libvips releases the GIL while encoding.
+ENCODE_THREADS = max(2, min(6, (os.cpu_count() or 4) // 2))
+
+
+class _EncoderPool:
+    """
+    Runs encode jobs on a thread pool with a bounded number in flight, handing results to `on_done`
+    in submission order (None for a job that failed). A failed job is reported and the rest continue;
+    `failed` is set so the process can exit with an error code at the end.
+    """
+
+    def __init__(self, on_done: Callable[[Any], None]) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=ENCODE_THREADS)
+        self._pending: deque[tuple[Future, str | None]] = deque()
+        self._on_done = on_done
+        # pending jobs hold full upscaled pages in memory
+        self._limit = ENCODE_THREADS + 2
+        self.failed = False
+
+    def submit(self, fn: Callable[..., Any], *args: Any, key: str | None = None) -> None:
+        # jobs with the same key (output path) must not run concurrently
+        while key is not None and any(k == key for _, k in self._pending):
+            self._finish_oldest()
+        while len(self._pending) >= self._limit:
+            self._finish_oldest()
+        self._pending.append((self._executor.submit(fn, *args), key))
+
+    def _finish_oldest(self) -> None:
+        future, _ = self._pending.popleft()
+        try:
+            result = future.result()
+        except Exception as e:
+            print_line(f"Error saving image: {e!r}")
+            self.failed = True
+            result = None
+        self._on_done(result)
+
+    def close(self) -> None:
+        while self._pending:
+            self._finish_oldest()
+        self._executor.shutdown()
+
+
+def finish_postprocess_process(pool: _EncoderPool) -> None:
+    """
+    Ends a postprocess child process once all its outputs are written. Exits immediately, skipping
+    interpreter teardown (as the main process does), with a nonzero code if any image failed to save.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1 if pool.failed else 0)
 
 
 def postprocess_worker_zip(
@@ -1045,6 +1157,21 @@ def postprocess_worker_zip(
     """
     # print("postprocess_worker_zip entering")
     with ZipFile(output_zip_path, "w", ZIP_DEFLATED) as output_zip:
+
+        def write_entry(entry: tuple[str, bytes] | None) -> None:
+            # entries are written in input order, from this thread only
+            if entry is not None:
+                output_zip.writestr(*entry)
+            print_line("PROGRESS=postprocess_worker_zip_image")
+
+        def encode_entry(name: str, *args: Any) -> tuple[str, bytes]:
+            print_line(f"save image to zip: {name}")
+            return name, encode_image(*args)
+
+        def copy_entry(name: str, data: bytes) -> tuple[str, bytes]:
+            return name, data
+
+        pool = _EncoderPool(write_entry)
         while True:
             (
                 image,
@@ -1057,11 +1184,10 @@ def postprocess_worker_zip(
             if image is None:
                 break
             if is_image:
-                # image = postprocess_image(image)
-                save_image_zip(
-                    image,
+                pool.submit(
+                    encode_entry,
                     str(Path(file_name).with_suffix(f".{image_format}")),
-                    output_zip,
+                    to_uint8_fast(image),
                     image_format,
                     lossy_compression_quality,
                     use_lossless_compression,
@@ -1073,9 +1199,10 @@ def postprocess_worker_zip(
                     is_grayscale,
                 )
             else:  # copy file
-                output_zip.writestr(file_name, image)
-            print("PROGRESS=postprocess_worker_zip_image", flush=True)
-        print("PROGRESS=postprocess_worker_zip_archive", flush=True)
+                pool.submit(copy_entry, file_name, image)
+        pool.close()
+        print_line("PROGRESS=postprocess_worker_zip_archive")
+    finish_postprocess_process(pool)
 
 
 def postprocess_worker_folder(
@@ -1092,16 +1219,18 @@ def postprocess_worker_folder(
     wait for postprocess queue, for each queue entry, save the image to the output folder
     """
     # print("postprocess_worker_folder entering")
+    pool = _EncoderPool(lambda _: print_line("PROGRESS=postprocess_worker_folder"))
     while True:
         image, file_name, _, is_grayscale, original_width, original_height = (
             postprocess_queue.get()
         )
         if image is None:
             break
-        image = postprocess_image(image)
-        save_image(
-            image,
-            os.path.join(output_folder_path, str(Path(f"{file_name}.{image_format}"))),
+        output_file_path = os.path.join(output_folder_path, str(Path(f"{file_name}.{image_format}")))
+        pool.submit(
+            save_image,
+            to_uint8_fast(image),
+            output_file_path,
             image_format,
             lossy_compression_quality,
             use_lossless_compression,
@@ -1111,10 +1240,10 @@ def postprocess_worker_folder(
             target_width,
             target_height,
             is_grayscale,
+            key=os.path.normcase(os.path.abspath(output_file_path)),
         )
-        print("PROGRESS=postprocess_worker_folder", flush=True)
-
-    # print("postprocess_worker_folder exiting")
+    pool.close()
+    finish_postprocess_process(pool)
 
 
 def postprocess_worker_image(
@@ -1130,16 +1259,17 @@ def postprocess_worker_image(
     """
     wait for postprocess queue, for each queue entry, save the image to the output file path
     """
+    pool = _EncoderPool(lambda _: print_line("PROGRESS=postprocess_worker_image"))
     while True:
         image, _, _, is_grayscale, original_width, original_height = (
             postprocess_queue.get()
         )
         if image is None:
             break
-        # image = postprocess_image(image)
 
-        save_image(
-            image,
+        pool.submit(
+            save_image,
+            to_uint8_fast(image),
             output_file_path,
             image_format,
             lossy_compression_quality,
@@ -1151,7 +1281,38 @@ def postprocess_worker_image(
             target_height,
             is_grayscale,
         )
-        print("PROGRESS=postprocess_worker_image", flush=True)
+    pool.close()
+    finish_postprocess_process(pool)
+
+
+_postprocess_failed = False
+
+
+def start_postprocess_process(process: Process) -> None:
+    """
+    Starts a postprocess (saving) child process with GPUs hidden. The child re-imports this module,
+    whose imports run accelerator detection; without this it would initialize the GPU runtime (and use
+    VRAM) for nothing.
+    """
+    hidden = {"CUDA_VISIBLE_DEVICES": "-1", "HIP_VISIBLE_DEVICES": "-1"}
+    saved = {key: os.environ.get(key) for key in hidden}
+    os.environ.update(hidden)
+    try:
+        process.start()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def join_postprocess_process(process: Process) -> None:
+    global _postprocess_failed
+    process.join()
+    if process.exitcode != 0:
+        _postprocess_failed = True
+        print_line(f"Saving images failed (exit code {process.exitcode})")
 
 
 def upscale_archive_file(
@@ -1209,12 +1370,12 @@ def upscale_archive_file(
             target_height,
         ),
     )
-    postprocess_process.start()
+    start_postprocess_process(postprocess_process)
 
     # wait for all processes
     preprocess_process.join()
     upscale_process.join()
-    postprocess_process.join()
+    join_postprocess_process(postprocess_process)
 
 
 def upscale_image_file(
@@ -1272,12 +1433,12 @@ def upscale_image_file(
             target_height,
         ),
     )
-    postprocess_process.start()
+    start_postprocess_process(postprocess_process)
 
     # wait for all processes
     preprocess_process.join()
     upscale_process.join()
-    postprocess_process.join()
+    join_postprocess_process(postprocess_process)
 
 
 def upscale_file(
@@ -1415,12 +1576,12 @@ def upscale_folder(
             target_height,
         ),
     )
-    postprocess_process.start()
+    start_postprocess_process(postprocess_process)
 
     # wait for all processes
     preprocess_process.join()
     upscale_process.join()
-    postprocess_process.join()
+    join_postprocess_process(postprocess_process)
 
 
 current_file_directory = os.path.dirname(os.path.abspath(__file__))
@@ -1532,7 +1693,9 @@ settings_parser = SettingsParser(
     {
         "use_cpu": settings["SelectedDeviceIndex"] == 0,
         "use_fp16": settings["UseFp16"],
-        "accelerator_device_index": settings["SelectedDeviceIndex"],
+        # SelectedDeviceIndex indexes the GUI device list, which has the CPU at index 0;
+        # accelerator_device_index indexes the accelerator-only list
+        "accelerator_device_index": max(settings["SelectedDeviceIndex"] - 1, 0),
         "budget_limit": 0,
     }
 )
@@ -1544,15 +1707,24 @@ context = _ExecutorNodeContext(ProgressController(), settings_parser, Path())
 gamma1icc = get_gamma_icc_profile()
 dotgain20icc = get_dot20_icc_profile()
 
-dotgain20togamma1transform = ImageCms.buildTransformFromOpenProfiles(
-    dotgain20icc, gamma1icc, "L", "L"
-)
-gamma1todotgain20transform = ImageCms.buildTransformFromOpenProfiles(
-    gamma1icc, dotgain20icc, "L", "L"
-)
+# LittleCMS transforms cache their last pixel and aren't safe to share between the encoder
+# threads, so each thread builds its own
+_thread_local = threading.local()
+
+
+def _dotgain_transforms() -> tuple[ImageCms.ImageCmsTransform, ImageCms.ImageCmsTransform]:
+    transforms = getattr(_thread_local, "dotgain_transforms", None)
+    if transforms is None:
+        transforms = (
+            ImageCms.buildTransformFromOpenProfiles(dotgain20icc, gamma1icc, "L", "L"),
+            ImageCms.buildTransformFromOpenProfiles(gamma1icc, dotgain20icc, "L", "L"),
+        )
+        _thread_local.dotgain_transforms = transforms
+    return transforms
 
 if __name__ == "__main__":
     spandrel_custom.install()
+    log_timing("startup_imports", _PROCESS_START)
     # gc.disable() #TODO!!!!!!!!!!!!
     # Record the start time
     start_time = time.time()
@@ -1625,4 +1797,8 @@ if __name__ == "__main__":
     elapsed_time = end_time - start_time
 
     # Print the elapsed time
-    print(f"Elapsed time: {elapsed_time:.2f} seconds")
+    print(f"Elapsed time: {elapsed_time:.2f} seconds", flush=True)
+
+    # All workers are joined and outputs written. Skip interpreter teardown: the ROCm runtime has been
+    # seen to hang while shutting down on Windows, which would leave the GUI waiting forever.
+    os._exit(1 if _postprocess_failed else 0)

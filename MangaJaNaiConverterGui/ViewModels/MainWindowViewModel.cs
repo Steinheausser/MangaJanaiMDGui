@@ -1254,7 +1254,7 @@ namespace MangaJaNaiConverterGui.ViewModels
 
         public async Task CheckAndExtractBackend()
         {
-            await Task.Run(async () =>
+            var backendReady = await Task.Run(async () =>
             {
                 IsExtractingBackend = true;
 
@@ -1268,7 +1268,16 @@ namespace MangaJaNaiConverterGui.ViewModels
                     await DownloadModels();
                 }
 
-                if (!_pythonService.IsPythonInstalled() || !(await _pythonService.IsBackendUpdated()))
+                if ((!_pythonService.IsPythonInstalled() || !(await _pythonService.IsBackendUpdated())) && _pythonService.Flavor.Kind != BackendKind.Cuda)
+                {
+                    if (!await InstallPipBackend())
+                    {
+                        // leave the setup screen up showing the error; the partial environment was removed,
+                        // so the next app start or "Reinstall Python Environment" retries from scratch
+                        return false;
+                    }
+                }
+                else if (!_pythonService.IsPythonInstalled() || !(await _pythonService.IsBackendUpdated()))
                 {
                     // Download Python tgz
                     BackendSetupMainStatus = "Downloading Python Backend...";
@@ -1300,7 +1309,13 @@ namespace MangaJaNaiConverterGui.ViewModels
                 }
 
                 IsExtractingBackend = false;
+                return true;
             });
+
+            if (!backendReady)
+            {
+                return;
+            }
 
             var deviceResponse = await InitializeDeviceList();
             if (deviceResponse != null)
@@ -1382,7 +1397,74 @@ namespace MangaJaNaiConverterGui.ViewModels
 
 
 
-        public async Task<string[]> InstallUpdatePythonDependencies()
+        /// <summary>
+        /// Installs a plain Python and pip-installs the backend for non-NVIDIA GPUs (ROCm or DirectML),
+        /// instead of the prebuilt CUDA backend archive.
+        /// </summary>
+        private async Task<bool> InstallPipBackend()
+        {
+            var flavor = _pythonService.Flavor;
+            var pythonDownload = PythonService.PYTHON_DOWNLOADS["win32"];
+            var retryHint = "Restart the app or use \"Reinstall Python Environment\" to retry.";
+
+            try
+            {
+                if (Directory.Exists(_pythonService.PythonDirectory))
+                {
+                    Directory.Delete(_pythonService.PythonDirectory, true);
+                }
+                Directory.CreateDirectory(_pythonService.PythonDirectory);
+
+                BackendSetupMainStatus = "Downloading Python...";
+                var targetPath = Path.Join(_pythonService.PythonDirectory, pythonDownload.Filename);
+                await Downloader.DownloadFileAsync(pythonDownload.Url, targetPath, (progress) =>
+                {
+                    BackendSetupMainStatus = $"Downloading Python ({progress}%)...";
+                });
+
+                BackendSetupMainStatus = "Extracting Python...";
+                _pythonService.ExtractTgz(targetPath, _pythonService.PythonDirectory);
+                File.Delete(targetPath);
+
+                BackendSetupMainStatus = $"Installing Python Backend for {flavor.Description}. This downloads several GB and may take a while...";
+                var exitCode = await InstallUpdatePythonDependencies();
+
+                if (exitCode != 0)
+                {
+                    DeletePartialPythonDirectory();
+                    BackendSetupMainStatus = $"Python Backend installation failed (exit code {exitCode}). See {Path.Combine(_pythonService.LogsDirectory, "install.log")}. {retryHint}";
+                    return false;
+                }
+
+                // Flavor.txt (flavor + torch pin) is what IsBackendUpdated checks for pip-installed flavors
+                await File.WriteAllTextAsync(_pythonService.PythonBackendFlavorPath, _pythonService.FlavorStamp);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"InstallPipBackend failed: {ex}");
+                DeletePartialPythonDirectory();
+                BackendSetupMainStatus = $"Python Backend installation failed: {ex.Message}. {retryHint}";
+                return false;
+            }
+        }
+
+        private void DeletePartialPythonDirectory()
+        {
+            try
+            {
+                if (Directory.Exists(_pythonService.PythonDirectory))
+                {
+                    Directory.Delete(_pythonService.PythonDirectory, true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to delete partial Python environment: {ex.Message}");
+            }
+        }
+
+        public async Task<int> InstallUpdatePythonDependencies()
         {
             var cmd = _pythonService.InstallUpdatePythonDependenciesCommand;
             Debug.WriteLine(cmd);
@@ -1433,11 +1515,12 @@ namespace MangaJaNaiConverterGui.ViewModels
                     process.BeginOutputReadLine();
                     process.BeginErrorReadLine(); // Start asynchronous reading of the output
                     await process.WaitForExitAsync();
+                    return process.ExitCode;
                 }
                 catch (IOException) { }
             }
 
-            return [];
+            return -1;
         }
 
         public void CheckAndDoBackup()

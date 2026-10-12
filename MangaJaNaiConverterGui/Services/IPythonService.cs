@@ -22,6 +22,9 @@ namespace MangaJaNaiConverterGui.Services
         string AppStateFilename { get; }
         string InstallUpdatePythonDependenciesCommand { get; }
         string PythonBackendVersionPath { get; }
+        string PythonBackendFlavorPath { get; }
+        BackendFlavor Flavor { get; }
+        string FlavorStamp { get; }
         Version BackendVersion { get; }
         void ExtractTgz(string gzArchiveName, string destFolder);
         void ExtractZip(string archivePath, string outFolder, ProgressChanged progressChanged);

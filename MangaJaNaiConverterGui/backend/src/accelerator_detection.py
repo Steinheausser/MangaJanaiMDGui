@@ -21,6 +21,7 @@ class AcceleratorType(Enum):
     ROCM = "rocm"  # AMD GPUs using ROCm
     MPS = "mps"    # Apple Metal Performance Shaders
     XPU = "xpu"    # Intel GPUs
+    DIRECTML = "directml"  # Any DirectX 12 GPU via ONNX Runtime DirectML (no PyTorch support)
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,9 @@ class AcceleratorDevice:
     @property
     def torch_device(self) -> torch.device:
         """Get the corresponding torch.device"""
+        if self.type == AcceleratorType.DIRECTML:
+            # DirectML inference runs through ONNX Runtime; PyTorch only needs the model on the CPU
+            return torch.device("cpu")
         return torch.device(self.device_string)
 
     @override
@@ -97,11 +101,17 @@ class AcceleratorDetector:
         # Detect Intel XPU
         devices.extend(self._detect_xpu_devices())
 
+        # Detect DirectML (ONNX Runtime) devices last, so native PyTorch devices keep their positions
+        devices.extend(self._detect_directml_devices())
+
         return devices
 
     def _detect_cuda_devices(self) -> list[AcceleratorDevice]:
         """Detect NVIDIA CUDA devices"""
         devices = []
+        if getattr(torch.version, "hip", None) is not None:
+            # ROCm builds expose AMD GPUs through the torch.cuda API; they are listed by _detect_rocm_devices
+            return devices
         try:
             if torch.cuda.is_available():
                 for i in range(torch.cuda.device_count()):
@@ -142,8 +152,15 @@ class AcceleratorDetector:
                     for i in range(torch.cuda.device_count()):
                         try:
                             device_props = torch.cuda.get_device_properties(i)
+                            # ROCm builds only contain kernels for some GPU architectures (e.g. the
+                            # gfx120X build cannot run on a Ryzen iGPU), so skip devices it can't use
+                            arch = device_props.gcnArchName.split(":")[0]
+                            supported_archs = torch.cuda.get_arch_list()
+                            if supported_archs and arch not in supported_archs:
+                                logger.info(f"Skipping ROCm device {i} ({device_props.name}, {arch}): not supported by this PyTorch build")
+                                continue
                             memory_info = torch.cuda.mem_get_info(i)
-                            
+
                             devices.append(AcceleratorDevice(
                                 type=AcceleratorType.ROCM,
                                 index=i,
@@ -218,6 +235,35 @@ class AcceleratorDetector:
         
         return devices
 
+    def _detect_directml_devices(self) -> list[AcceleratorDevice]:
+        """Detect DirectX 12 GPUs usable through ONNX Runtime's DirectML execution provider"""
+        devices = []
+        try:
+            import onnxruntime  # noqa: PLC0415
+        except Exception as e:
+            logger.debug(f"DirectML not available (onnxruntime not importable): {e}")
+            return devices
+        try:
+            if "DmlExecutionProvider" not in onnxruntime.get_available_providers():
+                return devices
+            from dxgi_adapters import enumerate_dml_adapters  # noqa: PLC0415
+
+            for adapter in enumerate_dml_adapters():
+                devices.append(AcceleratorDevice(
+                    type=AcceleratorType.DIRECTML,
+                    index=adapter.index,
+                    name=f"{adapter.name} (DirectML)",
+                    memory_total=adapter.dedicated_video_memory or None,
+                    supports_fp16=True,   # DirectML runs FP16 on all DX12 feature level 11+ GPUs
+                    supports_bf16=False,
+                    device_string=f"dml:{adapter.index}",
+                ))
+                logger.info(f"Detected DirectML device {adapter.index}: {adapter.name}")
+        except Exception as e:
+            logger.debug(f"DirectML detection failed: {e}")
+
+        return devices
+
     def _cuda_supports_fp16(self, device_props: Any, device_index: int) -> bool:
         """Check if CUDA device supports FP16"""
         try:
@@ -262,9 +308,9 @@ class AcceleratorDetector:
         if not prefer_gpu:
             return self.get_cpu_device()
 
-        # Priority order: CUDA > XPU > MPS > ROCm > CPU
-        for device_type in [AcceleratorType.CUDA, AcceleratorType.XPU, AcceleratorType.MPS, 
-                           AcceleratorType.ROCM]:
+        # Priority order: CUDA > ROCm > XPU > MPS > DirectML > CPU
+        for device_type in [AcceleratorType.CUDA, AcceleratorType.ROCM, AcceleratorType.XPU,
+                           AcceleratorType.MPS, AcceleratorType.DIRECTML]:
             devices = self.get_devices_by_type(device_type)
             if devices:
                 return devices[0]  # Return the first device of this type

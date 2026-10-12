@@ -76,17 +76,18 @@ def load_model_node(
     assert os.path.isfile(path), f"Path {path} is not a file"
 
     exec_options = get_settings(context)
-    pytorch_device = exec_options.device
 
     try:
         logger.debug(f"Reading state dict from path: {path}")
 
-        model_descriptor = ModelLoader(pytorch_device).load_from_file(path)
+        # Load on the CPU: models are loaded by the preprocessing thread while the GPU is busy
+        # upscaling, and copying weights to the GPU here would queue behind that work. The upscale
+        # step moves the model to the device (with the right dtype and memory format) on first use.
+        model_descriptor = ModelLoader(torch.device("cpu")).load_from_file(path)
 
         for _, v in model_descriptor.model.named_parameters():
             v.requires_grad = False
         model_descriptor.model.eval()
-        model_descriptor = model_descriptor.to(pytorch_device)
         # if should_use_fp16:
         #     model_descriptor.model.half()
         # else:
